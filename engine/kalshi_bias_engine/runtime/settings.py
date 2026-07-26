@@ -40,6 +40,16 @@ class Settings(BaseSettings):
     )
     kalshi_key_id: str = Field(default="")
     kalshi_private_key_pem: str = Field(default="")
+    kalshi_private_key_path: str = Field(
+        default="",
+        description="Optional path to Kalshi PEM. Takes precedence over inline PEM.",
+    )
+
+    def resolved_kalshi_private_key_pem(self) -> str:
+        if self.kalshi_private_key_path:
+            with open(self.kalshi_private_key_path) as f:
+                return f.read()
+        return self.kalshi_private_key_pem
 
     kraken_rest_base: str = Field(default="https://api.kraken.com")
     kraken_ws_url: str = Field(default="wss://ws.kraken.com/v2")

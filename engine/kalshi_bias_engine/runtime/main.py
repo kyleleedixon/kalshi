@@ -336,7 +336,7 @@ async def run() -> None:
             api_base=settings.kalshi_api_base,
             signer=KalshiSigner(
                 key_id=settings.kalshi_key_id,
-                private_key_pem=settings.kalshi_private_key_pem,
+                private_key_pem=settings.resolved_kalshi_private_key_pem(),
             ),
         ),
         spool=writer,
