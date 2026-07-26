@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# local write-spool for Neon outages
+spool.sqlite
+spool.sqlite-*
+
+# dashboard
+node_modules/
+.next/
+.vercel/
+
+# editor
+.DS_Store
+.idea/
+.vscode/

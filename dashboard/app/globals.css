@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-neutral-950 text-neutral-100 antialiased;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+table {
+  @apply w-full text-sm;
+}
+
+th,
+td {
+  @apply py-1 px-2 text-left border-b border-neutral-800 whitespace-nowrap;
+}
+
+th {
+  @apply text-neutral-400 font-normal;
+}
