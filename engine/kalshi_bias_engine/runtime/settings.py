@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     # calibration gate defaults
     phase_gate_min_sample: int = Field(default=200)
 
+    # --- Write-volume controls -------------------------------------------
+    # Only persist a signal if it's "interesting": FRESH staleness AND one
+    # of (a) meaningful edge vs kalshi mid, (b) top-N ranked. Everything
+    # else is dropped with probability (1 - persist_sample_rate) so the
+    # calibration corpus still gets baseline coverage. Set the gap to 0.0
+    # to fall back to old "persist everything" behavior.
+    persist_min_edge_gap: float = Field(default=0.02)
+    persist_top_n_rank: int = Field(default=20)
+    persist_sample_rate: float = Field(default=0.02)
+    # Raw HTTP response spooling is phase-3 audit telemetry (huge blobs).
+    # Off by default to keep Neon write volume sane.
+    persist_raw_pulls: bool = Field(default=False)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

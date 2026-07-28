@@ -57,12 +57,14 @@ class KalshiConfig:
 
 class KalshiClient:
     def __init__(self, config: KalshiConfig, spool: SpooledWriter,
-                 http_client: httpx.AsyncClient | None = None) -> None:
+                 http_client: httpx.AsyncClient | None = None,
+                 record_raw_pulls: bool = False) -> None:
         self._cfg = config
         self._spool = spool
         self._http = http_client or httpx.AsyncClient(
             base_url=config.api_base, timeout=15.0
         )
+        self._record_raw = record_raw_pulls
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -70,6 +72,8 @@ class KalshiClient:
     async def _record(
         self, endpoint: str, params: dict | None, resp: httpx.Response
     ) -> None:
+        if not self._record_raw:
+            return
         try:
             body = resp.json()
         except Exception:

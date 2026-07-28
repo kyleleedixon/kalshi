@@ -114,13 +114,44 @@ class SpooledWriter:
         if not rows:
             return 0
 
-        drained = 0
+        items: list[tuple[int, str, dict[str, Any], int]] = []
         for row_id, kind, payload_json, attempts in rows:
             try:
-                payload = json.loads(payload_json)
-                result = self._sink(kind, payload)
-                if asyncio.iscoroutine(result):
-                    await result
+                items.append((row_id, kind, json.loads(payload_json), attempts))
+            except Exception as e:
+                self._conn.execute(
+                    "UPDATE spool SET attempts = attempts + 1, last_error = ? "
+                    "WHERE id = ?",
+                    (f"payload_decode_error: {e}", row_id),
+                )
+                return 0
+
+        # Fast path: one session for the whole batch. Neon round-trip
+        # dominates single-row writes; batching amortizes it.
+        batch = [(k, p) for (_id, k, p, _a) in items]
+        apply_batch = getattr(self._sink, "apply_batch", None)
+        if apply_batch is not None:
+            try:
+                t0 = time.time()
+                await asyncio.to_thread(apply_batch, batch)
+                elapsed_ms = int((time.time() - t0) * 1000)
+                ids = [i for (i, _, _, _) in items]
+                placeholders = ",".join("?" * len(ids))
+                self._conn.execute(
+                    f"DELETE FROM spool WHERE id IN ({placeholders})", ids
+                )
+                log.info("spool.batch_drained",
+                         batch_size=len(items), elapsed_ms=elapsed_ms)
+                return len(items)
+            except Exception as e:
+                log.info("spool.batch_failed_falling_back",
+                         batch_size=len(items), error=str(e))
+
+        # Slow path: per-row so a bad row can be isolated + retried.
+        drained = 0
+        for row_id, kind, payload, attempts in items:
+            try:
+                await asyncio.to_thread(self._sink, kind, payload)
                 self._conn.execute("DELETE FROM spool WHERE id = ?", (row_id,))
                 drained += 1
             except Exception as e:
@@ -129,7 +160,6 @@ class SpooledWriter:
                     "WHERE id = ?",
                     (str(e), row_id),
                 )
-                # Stop this batch on first failure to preserve ordering.
                 log.info("spool.write_deferred", kind=kind,
                          attempts=attempts + 1, error=str(e))
                 break

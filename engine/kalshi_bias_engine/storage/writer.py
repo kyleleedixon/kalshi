@@ -58,6 +58,27 @@ def _parse_ts(v: Any) -> datetime | None:
     return datetime.fromisoformat(v)
 
 
+class _BatchCache:
+    """Session-scoped pk cache with lazy-flush ORM handles.
+
+    Signals in a batch reference oracle_estimates in the same batch, which
+    reference contracts upserted in the same batch. Round-tripping SELECT id
+    ... for every reference caps drain throughput at ~3 rows/sec (each
+    round-trip to Neon ~100ms).
+
+    Values are ``int`` (pk already known — e.g. contract upserted via
+    RETURNING) or an ORM instance (pk not yet assigned — sess.add()'d but
+    not flushed). Looking up an ORM value triggers a single ``sess.flush()``
+    that sends every pending insert as one insertmanyvalues round-trip, then
+    replaces the entries with their assigned pks.
+    """
+
+    def __init__(self) -> None:
+        self.contract_pk: dict[str, int] = {}
+        self.oracle_estimate_pk: dict[str, Any] = {}
+        self.signal_pk: dict[str, Any] = {}
+
+
 class NeonSink:
     """Drain-side handler. One instance per engine process.
 
@@ -67,13 +88,199 @@ class NeonSink:
 
     def __init__(self, resolver: PkResolver | None = None) -> None:
         self._resolver = resolver or PkResolver()
+        self._cache: _BatchCache | None = None
+        # Persistent contract_id -> pk cache. Contract pks are immutable
+        # once assigned, so a hit avoids the ~100ms Neon SELECT round-trip.
+        # This is the difference between the drain keeping up with the
+        # discovery loop and falling behind: without it, oracle_estimates
+        # in a later batch each SELECT the pk of their contract, and each
+        # SELECT is a Neon round-trip. ~1k crypto contracts total → cache
+        # size is negligible.
+        self._contract_pk_cache: dict[str, int] = {}
 
     def __call__(self, kind: str, payload: dict[str, Any]) -> None:
-        with session_scope() as sess:
-            handler = self._HANDLERS.get(kind)
-            if handler is None:
-                raise ValueError(f"unknown spool kind: {kind}")
-            handler(self, sess, payload)
+        self._cache = _BatchCache()
+        try:
+            with session_scope() as sess:
+                handler = self._HANDLERS.get(kind)
+                if handler is None:
+                    raise ValueError(f"unknown spool kind: {kind}")
+                handler(self, sess, payload)
+        finally:
+            self._cache = None
+
+    def apply_batch(self, items: list[tuple[str, dict[str, Any]]]) -> int:
+        """Apply a list of ``(kind, payload)`` writes in a single session.
+
+        Amortizes the Neon connect + commit round-trip across the batch —
+        per-row session_scope() at Neon's typical 100-300ms round-trip
+        latency caps throughput at ~5-10 writes/sec, which is not enough
+        for our discovery cadence. On any handler failure the whole batch
+        rolls back and the caller retries item-by-item to isolate the bad
+        row.
+        """
+        applied = 0
+        self._cache = _BatchCache()
+        try:
+            with session_scope() as sess:
+                # Dependency order: contract -> quote -> oracle_estimate ->
+                # signal -> paper_order. Processing kind-by-kind (rather than
+                # spool order) lets a single sess.flush() between kinds bulk
+                # push all pending inserts of that kind in one round-trip.
+                # Spool interleaves O/S, which without regrouping caused
+                # sess.flush() to fire per signal (~30ms each × 250 = 7s+).
+                by_kind: dict[str, list[dict[str, Any]]] = {}
+                for kind, payload in items:
+                    by_kind.setdefault(kind, []).append(payload)
+
+                self._bulk_contract_upsert(
+                    sess, by_kind.pop("contract_upsert", [])
+                )
+                self._warm_contract_pks(sess, items)
+
+                for kind in ("quote", "oracle_estimate", "signal",
+                             "paper_order", "paper_fill", "settlement",
+                             "settlement_basis", "realized_vol",
+                             "bias_params", "calibration_snapshot",
+                             "heartbeat", "raw_pull"):
+                    payloads = by_kind.pop(kind, None)
+                    if not payloads:
+                        continue
+                    handler = self._HANDLERS[kind]
+                    for p in payloads:
+                        handler(self, sess, p)
+                        applied += 1
+                    # Flush all just-added rows in one insertmanyvalues
+                    # round-trip so the NEXT kind sees assigned pks and
+                    # doesn't trigger a per-row flush from the cache lookup.
+                    sess.flush()
+                applied += len(items) - applied - len(by_kind.get("contract_upsert", []))
+                # Any remaining unknown kinds (shouldn't happen — defensive).
+                for kind, payloads in by_kind.items():
+                    if kind == "contract_upsert":
+                        applied += len(payloads)
+                        continue
+                    raise ValueError(f"unknown spool kind: {kind}")
+        finally:
+            self._cache = None
+        return applied
+
+    def _warm_contract_pks(
+        self, sess, items: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        """One SELECT to fetch pks for any referenced contracts not yet
+        cached. Without this the very first batch after a restart does one
+        SELECT per quote/oracle_estimate."""
+        needed: set[str] = set()
+        for _kind, payload in items:
+            cid = payload.get("contract_id")
+            if cid and cid not in self._contract_pk_cache:
+                needed.add(cid)
+        if not needed:
+            return
+        from sqlalchemy import select
+        rows = sess.execute(
+            select(Contract.contract_id, Contract.id).where(
+                Contract.contract_id.in_(needed)
+            )
+        ).all()
+        for cid, pk in rows:
+            self._contract_pk_cache[cid] = pk
+
+    def _bulk_contract_upsert(
+        self, sess, payloads: list[dict[str, Any]]
+    ) -> None:
+        """Upsert all contract rows in a batch in a single round-trip.
+
+        Per-row ``pg_insert().returning()`` was 1 round-trip per contract,
+        which dominated drain latency (100 contracts × 100ms round-trip =
+        10s per batch). Batching via ``pg_insert(...).values(list)`` sends
+        them all as one INSERT ... ON CONFLICT and returns every pk in one
+        round-trip.
+        """
+        if not payloads:
+            return
+        # De-dup within the batch: repeated contract_ids in one INSERT would
+        # trigger the "ON CONFLICT cannot target row a second time" error.
+        # Keep the last occurrence — it's the freshest metadata.
+        by_id: dict[str, dict[str, Any]] = {}
+        for p in payloads:
+            by_id[p["contract_id"]] = p
+        rows = [
+            {
+                "contract_id": p["contract_id"],
+                "domain": p["domain"],
+                "underlying": p["underlying"],
+                "side": p["side"],
+                "open_time": _parse_ts(p.get("open_time")),
+                "close_time": _parse_ts(p.get("close_time")),
+                "settlement_time": _parse_ts(p.get("settlement_time")),
+                "settlement_source": p["settlement_source"],
+                "features": p.get("features", {}),
+            }
+            for p in by_id.values()
+        ]
+        stmt = pg_insert(Contract).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["contract_id"],
+            set_={
+                "open_time": stmt.excluded.open_time,
+                "close_time": stmt.excluded.close_time,
+                "settlement_time": stmt.excluded.settlement_time,
+                "settlement_source": stmt.excluded.settlement_source,
+                "features": stmt.excluded.features,
+            },
+        ).returning(Contract.id, Contract.contract_id)
+        result = sess.execute(stmt)
+        for pk, cid in result:
+            self._contract_pk_cache[cid] = pk
+            if self._cache is not None:
+                self._cache.contract_pk[cid] = pk
+
+    def _contract_pk(self, sess, contract_id: str) -> int:
+        pk = self._contract_pk_cache.get(contract_id)
+        if pk is not None:
+            return pk
+        if self._cache is not None:
+            pk = self._cache.contract_pk.get(contract_id)
+            if pk is not None:
+                self._contract_pk_cache[contract_id] = pk
+                return pk
+        pk = self._resolver.contract_pk(sess, contract_id)
+        self._contract_pk_cache[contract_id] = pk
+        if self._cache is not None:
+            self._cache.contract_pk[contract_id] = pk
+        return pk
+
+    def _oracle_estimate_pk(self, sess, external_id: str) -> int:
+        if self._cache is not None:
+            v = self._cache.oracle_estimate_pk.get(external_id)
+            if v is not None:
+                if isinstance(v, int):
+                    return v
+                if v.id is None:
+                    sess.flush()
+                self._cache.oracle_estimate_pk[external_id] = v.id
+                return v.id
+        pk = self._resolver.oracle_estimate_pk(sess, external_id)
+        if self._cache is not None:
+            self._cache.oracle_estimate_pk[external_id] = pk
+        return pk
+
+    def _signal_pk(self, sess, external_id: str) -> int:
+        if self._cache is not None:
+            v = self._cache.signal_pk.get(external_id)
+            if v is not None:
+                if isinstance(v, int):
+                    return v
+                if v.id is None:
+                    sess.flush()
+                self._cache.signal_pk[external_id] = v.id
+                return v.id
+        pk = self._resolver.signal_pk(sess, external_id)
+        if self._cache is not None:
+            self._cache.signal_pk[external_id] = pk
+        return pk
 
     # -- handlers -----------------------------------------------------------
 
@@ -88,8 +295,9 @@ class NeonSink:
         ))
 
     def _contract_upsert(self, sess, payload: dict[str, Any]) -> None:
+        contract_id = payload["contract_id"]
         stmt = pg_insert(Contract).values(
-            contract_id=payload["contract_id"],
+            contract_id=contract_id,
             domain=payload["domain"],
             underlying=payload["underlying"],
             side=payload["side"],
@@ -112,11 +320,13 @@ class NeonSink:
                 "settlement_source": stmt.excluded.settlement_source,
                 "features": stmt.excluded.features,
             },
-        )
-        sess.execute(stmt)
+        ).returning(Contract.id)
+        pk = sess.execute(stmt).scalar_one()
+        if self._cache is not None:
+            self._cache.contract_pk[contract_id] = pk
 
     def _quote(self, sess, payload: dict[str, Any]) -> None:
-        contract_pk = self._resolver.contract_pk(sess, payload["contract_id"])
+        contract_pk = self._contract_pk(sess, payload["contract_id"])
         sess.add(Quote(
             contract_pk=contract_pk,
             bid=payload.get("bid"),
@@ -129,8 +339,8 @@ class NeonSink:
         ))
 
     def _oracle_estimate(self, sess, payload: dict[str, Any]) -> None:
-        contract_pk = self._resolver.contract_pk(sess, payload["contract_id"])
-        sess.add(OracleEstimate(
+        contract_pk = self._contract_pk(sess, payload["contract_id"])
+        obj = OracleEstimate(
             external_id=payload["external_id"],
             contract_pk=contract_pk,
             oracle_name=payload["oracle_name"],
@@ -142,14 +352,20 @@ class NeonSink:
             data_ts=_parse_ts(payload["data_ts"]),
             provenance=payload.get("provenance", {}),
             ingest_ts=_parse_ts(payload["ingest_ts"]),
-        ))
+        )
+        sess.add(obj)
+        if self._cache is not None:
+            # Cache the ORM handle; flush is deferred until a signal in the
+            # same batch actually needs the pk — that flush sends every
+            # pending oracle_estimate in one insertmanyvalues round-trip.
+            self._cache.oracle_estimate_pk[payload["external_id"]] = obj
 
     def _signal(self, sess, payload: dict[str, Any]) -> None:
-        contract_pk = self._resolver.contract_pk(sess, payload["contract_id"])
-        oracle_pk = self._resolver.oracle_estimate_pk(
+        contract_pk = self._contract_pk(sess, payload["contract_id"])
+        oracle_pk = self._oracle_estimate_pk(
             sess, payload["oracle_estimate_external_id"]
         )
-        sess.add(Signal(
+        obj = Signal(
             external_id=payload["external_id"],
             contract_pk=contract_pk,
             oracle_estimate_pk=oracle_pk,
@@ -162,14 +378,17 @@ class NeonSink:
             bias_adjustments=payload.get("bias_adjustments", []),
             rank=payload.get("rank"),
             created_at=_parse_ts(payload["created_at"]),
-        ))
+        )
+        sess.add(obj)
+        if self._cache is not None:
+            self._cache.signal_pk[payload["external_id"]] = obj
 
     def _paper_order(self, sess, payload: dict[str, Any]) -> None:
-        contract_pk = self._resolver.contract_pk(sess, payload["contract_id"])
+        contract_pk = self._contract_pk(sess, payload["contract_id"])
         signal_pk: int | None = None
         sig_ext = payload.get("signal_external_id")
         if sig_ext:
-            signal_pk = self._resolver.signal_pk(sess, sig_ext)
+            signal_pk = self._signal_pk(sess, sig_ext)
         order = PaperOrder(
             signal_pk=signal_pk,
             contract_pk=contract_pk,
@@ -209,7 +428,7 @@ class NeonSink:
         ))
 
     def _settlement(self, sess, payload: dict[str, Any]) -> None:
-        contract_pk = self._resolver.contract_pk(sess, payload["contract_id"])
+        contract_pk = self._contract_pk(sess, payload["contract_id"])
         stmt = pg_insert(Settlement).values(
             contract_pk=contract_pk,
             outcome=payload["outcome"],
@@ -297,4 +516,9 @@ class NeonSink:
 
 
 def build_writer(spool_path: str) -> SpooledWriter:
-    return SpooledWriter(spool_path=spool_path, sink=NeonSink())
+    return SpooledWriter(
+        spool_path=spool_path,
+        sink=NeonSink(),
+        drain_interval_sec=0.2,
+        max_batch=500,
+    )

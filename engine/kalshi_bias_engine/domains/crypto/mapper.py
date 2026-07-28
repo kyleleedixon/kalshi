@@ -26,6 +26,8 @@ from ...oracles.kraken_digital import (
     FEAT_DIRECTION,
     FEAT_HORIZON_SEC,
     FEAT_STRIKE,
+    FEAT_STRIKE_HI,
+    FEAT_STRIKE_LO,
     FEAT_UNDERLYING,
 )
 
@@ -35,6 +37,27 @@ _UNDERLYINGS = {"BTC", "ETH", "SOL", "XRP"}
 # "KXBTC-...", "KXBTCD-...", "KXETHU-...". Prefer the ``category`` /
 # ``event_ticker`` fields when present rather than regex-parsing tickers.
 _TICKER_UNDERLYING_RE = re.compile(r"KX(?P<u>BTC|ETH|SOL|XRP)")
+
+# yes_sub_title shapes observed on live Kalshi crypto markets:
+#   "$64,750 to 64,999.99"   → bracket (1332 contracts in corpus)
+#   "$1,855 or above"        → threshold above (2687)
+#   "$54,199.99 or below"    → threshold below (9)
+#   "Target Price: $76.5338" → up_down (45)
+# The raw ``strike`` field usually carries just the UPPER bound of the
+# bracket, so the sub_title is the only reliable signal for the shape.
+_NUM = r"[\d,]+(?:\.\d+)?"
+_RE_BRACKET  = re.compile(rf"\${_NUM}\s*to\s*{_NUM}", re.IGNORECASE)
+_RE_ABOVE    = re.compile(rf"\${_NUM}\s*(?:or\s+above|and\s+above|\+)", re.IGNORECASE)
+_RE_BELOW    = re.compile(rf"\${_NUM}\s*(?:or\s+below|and\s+below|-)", re.IGNORECASE)
+_RE_TARGET   = re.compile(r"Target\s+Price", re.IGNORECASE)
+_RE_NUMBERS  = re.compile(_NUM)
+
+
+def _parse_money(s: str) -> float | None:
+    try:
+        return float(s.replace(",", ""))
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_iso(v: Any) -> datetime | None:
@@ -48,8 +71,23 @@ def _parse_iso(v: Any) -> datetime | None:
         return None
 
 
+_CRYPTO_SERIES_TICKERS = [
+    # Bitcoin
+    "KXBTC", "KXBTCD", "KXBTC15M",
+    # Ethereum
+    "KXETH", "KXETHD", "KXETH15M",
+    # Solana
+    "KXSOL", "KXSOLD", "KXSOL15M",
+    # XRP
+    "KXXRP", "KXXRPD", "KXXRP15M",
+]
+
+
 class CryptoMarketMapper(MarketMapperBase):
     domain = "crypto"
+
+    def discovery_series_tickers(self) -> list[str]:
+        return list(_CRYPTO_SERIES_TICKERS)
 
     def matches(self, raw_market: dict[str, Any]) -> bool:
         category = (raw_market.get("category") or "").lower()
@@ -67,31 +105,105 @@ class CryptoMarketMapper(MarketMapperBase):
         if underlying is None:
             return None
 
-        # Kalshi represents strike as either ``cap_strike`` / ``floor_strike``
-        # or a single ``strike`` on some product families. We prefer the
-        # explicit ``strike`` field, then fall back.
-        strike = (
-            raw_market.get("strike")
-            or raw_market.get("cap_strike")
-            or raw_market.get("floor_strike")
-        )
-        if strike is None:
-            return None
-        try:
-            strike = float(strike)
-        except (TypeError, ValueError):
-            return None
+        # The reliable signal for market shape is ``yes_sub_title``:
+        # Kalshi's ``strike`` field only holds the upper bound for brackets
+        # and doesn't distinguish above/below, so relying on it produced
+        # the 1332-contract mis-labeling that dominated calibration error.
+        sub = str(raw_market.get("yes_sub_title") or "")
+        raw_strike = raw_market.get("strike")
+        raw_cap = raw_market.get("cap_strike")
+        raw_floor = raw_market.get("floor_strike")
 
-        direction = self._infer_direction(raw_market)
+        strike: float | None = None
+        strike_lo: float | None = None
+        strike_hi: float | None = None
+        is_bracket = False
+        direction: str | None = None
+
+        # Sub-title takes priority when present.
+        if _RE_BRACKET.search(sub):
+            nums = _RE_NUMBERS.findall(sub)
+            if len(nums) >= 2:
+                a, b = _parse_money(nums[0]), _parse_money(nums[1])
+                if a is not None and b is not None:
+                    strike_lo, strike_hi = (a, b) if a <= b else (b, a)
+                    is_bracket = True
+                    strike = 0.5 * (strike_lo + strike_hi)
+        elif _RE_ABOVE.search(sub):
+            nums = _RE_NUMBERS.findall(sub)
+            if nums:
+                v = _parse_money(nums[0])
+                if v is not None:
+                    strike = v
+                    direction = "above"
+        elif _RE_BELOW.search(sub):
+            nums = _RE_NUMBERS.findall(sub)
+            if nums:
+                v = _parse_money(nums[0])
+                if v is not None:
+                    strike = v
+                    direction = "below"
+
+        # Fall back to explicit strike/cap/floor fields if sub-title didn't
+        # yield a strike (e.g. Target-Price up_down markets).
+        if strike is None and strike_lo is None:
+            if raw_cap is not None and raw_floor is not None:
+                try:
+                    strike_hi = float(raw_cap)
+                    strike_lo = float(raw_floor)
+                except (TypeError, ValueError):
+                    return None
+                if strike_hi < strike_lo:
+                    strike_hi, strike_lo = strike_lo, strike_hi
+                is_bracket = True
+                strike = 0.5 * (strike_lo + strike_hi)
+            elif raw_strike is not None:
+                try:
+                    strike = float(raw_strike)
+                except (TypeError, ValueError):
+                    return None
+            elif raw_cap is not None:
+                try:
+                    strike = float(raw_cap)
+                except (TypeError, ValueError):
+                    return None
+            elif raw_floor is not None:
+                try:
+                    strike = float(raw_floor)
+                except (TypeError, ValueError):
+                    return None
+            else:
+                return None
+
         close_time = _parse_iso(raw_market.get("close_time"))
         open_time = _parse_iso(raw_market.get("open_time"))
         expiration = _parse_iso(
             raw_market.get("expiration_time") or raw_market.get("settlement_time")
         )
 
-        contract_type = self._infer_contract_type(raw_market, close_time, expiration)
+        if is_bracket:
+            direction = "between"
+            contract_type = "bracket"
+        else:
+            if direction is None:
+                direction = self._infer_direction(raw_market)
+            contract_type = self._infer_contract_type(raw_market, close_time, expiration)
 
         horizon_seconds = self._horizon_seconds(open_time, close_time, expiration)
+
+        features = {
+            FEAT_UNDERLYING: underlying,
+            FEAT_STRIKE: strike,
+            FEAT_DIRECTION: direction,
+            FEAT_HORIZON_SEC: horizon_seconds,
+            FEAT_CONTRACT_TYPE: contract_type,
+            "raw_ticker": ticker,
+            "raw_event_ticker": raw_market.get("event_ticker"),
+            "raw_yes_sub_title": raw_market.get("yes_sub_title"),
+        }
+        if is_bracket:
+            features[FEAT_STRIKE_LO] = strike_lo
+            features[FEAT_STRIKE_HI] = strike_hi
 
         return Contract(
             contract_id=str(ticker),
@@ -100,18 +212,9 @@ class CryptoMarketMapper(MarketMapperBase):
             side=ContractSide.YES,   # We price YES; NO is (1-p) at policy layer.
             open_time=open_time,
             close_time=close_time,
-            settlement_time=expiration,
+            settlement_time=close_time or expiration,
             settlement_source=SettlementSource.CF_BENCHMARKS_RTI,
-            features={
-                FEAT_UNDERLYING: underlying,
-                FEAT_STRIKE: strike,
-                FEAT_DIRECTION: direction,
-                FEAT_HORIZON_SEC: horizon_seconds,
-                FEAT_CONTRACT_TYPE: contract_type,
-                "raw_ticker": ticker,
-                "raw_event_ticker": raw_market.get("event_ticker"),
-                "raw_yes_sub_title": raw_market.get("yes_sub_title"),
-            },
+            features=features,
         )
 
     # ---------------------------------------------------------- extractors
@@ -167,7 +270,7 @@ class CryptoMarketMapper(MarketMapperBase):
         expiration: datetime | None,
     ) -> int | None:
         now = datetime.now(timezone.utc)
-        target = expiration or close_time
+        target = close_time or expiration
         if target is None:
             return None
         secs = (target - now).total_seconds()

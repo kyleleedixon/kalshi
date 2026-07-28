@@ -8,6 +8,14 @@ cannot happen if the vol layer silently drops sample-size information.
 Vol is annualized: sigma_annual = sqrt( sum(log_returns^2) / horizon_seconds
                                        * SECONDS_PER_YEAR ).
 Crypto trades 24/7 so we use 365.25 * 86_400.
+
+Insufficient-window guard: annualizing a small observed window (e.g. 60s
+of ticks projected to a 24h horizon) produces wild sigma. A single 3%
+tick in a 60s window annualizes to >2000% vol. If the collected window
+covers less than ``MIN_WINDOW_FRACTION`` of the requested horizon we
+return sigma_annualized=0 so the oracle marks the estimate stale rather
+than pricing off garbage. As a belt-and-suspenders check we also cap the
+returned sigma at ``MAX_SANE_ANNUAL_SIGMA``.
 """
 
 from __future__ import annotations
@@ -18,6 +26,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 SECONDS_PER_YEAR = 365.25 * 86_400.0
+
+# Require the observed window to cover at least this fraction of the
+# horizon before we trust the annualized number.
+MIN_WINDOW_FRACTION = 0.25
+
+# Hard sanity cap on annualized sigma. BTC/ETH realised vol in extreme
+# stress rarely exceeds ~200% annualized; anything above this is almost
+# certainly a data spike or short-window artifact.
+MAX_SANE_ANNUAL_SIGMA = 5.0
 
 
 @dataclass
@@ -50,7 +67,15 @@ class RollingVol:
         cutoff = ts_epoch - self.horizon_seconds
         while self._points and self._points[0][0] < cutoff:
             self._points.popleft()
+        return self._snapshot(ts_epoch)
 
+    def snapshot(self) -> VolPoint | None:
+        """Compute a VolPoint from current state without mutating."""
+        if not self._points:
+            return None
+        return self._snapshot(self._points[-1][0])
+
+    def _snapshot(self, ts_epoch: float) -> VolPoint:
         n = len(self._points)
         if n < 2:
             return VolPoint(
@@ -61,14 +86,28 @@ class RollingVol:
                 data_ts=datetime.fromtimestamp(ts_epoch, tz=timezone.utc),
             )
 
+        pts = self._points
+        window = pts[-1][0] - pts[0][0]
+
+        # Insufficient window: refuse to annualize noise.
+        if window < MIN_WINDOW_FRACTION * self.horizon_seconds:
+            return VolPoint(
+                underlying=self.underlying,
+                horizon_seconds=self.horizon_seconds,
+                sigma_annualized=0.0,
+                tick_count=n,
+                data_ts=datetime.fromtimestamp(ts_epoch, tz=timezone.utc),
+            )
+
         s2 = 0.0
-        pts = list(self._points)
-        for i in range(1, len(pts)):
-            r = pts[i][1] - pts[i - 1][1]
+        prev_lp = pts[0][1]
+        for i in range(1, n):
+            lp = pts[i][1]
+            r = lp - prev_lp
             s2 += r * r
-        window = max(pts[-1][0] - pts[0][0], 1e-9)
-        sigma_per_sec = math.sqrt(s2 / window)
-        sigma_annual = sigma_per_sec * math.sqrt(SECONDS_PER_YEAR)
+            prev_lp = lp
+        sigma_per_sec = math.sqrt(s2 / max(window, 1e-9))
+        sigma_annual = min(sigma_per_sec * math.sqrt(SECONDS_PER_YEAR), MAX_SANE_ANNUAL_SIGMA)
 
         return VolPoint(
             underlying=self.underlying,
@@ -103,9 +142,4 @@ class MultiHorizonVol:
         r = self._roll.get((underlying, horizon))
         if r is None:
             return None
-        # Peek: replay the last recorded point through a no-op update by
-        # emitting a synthetic VolPoint from the current deque.
-        if not r._points:  # noqa: SLF001
-            return None
-        ts, lp = r._points[-1]  # noqa: SLF001
-        return r.update(ts, math.exp(lp))
+        return r.snapshot()

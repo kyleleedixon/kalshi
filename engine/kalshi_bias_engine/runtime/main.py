@@ -10,6 +10,7 @@ design in Phase 1.
 from __future__ import annotations
 
 import asyncio
+import random
 import signal
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from typing import Any
 import structlog
 
 from .. import __version__
+from ..core.estimate import StalenessReason
 from ..bias.model import ComposedBiasModel
 from ..bias.features import (
     LongshotCurveFeature,
@@ -92,6 +94,26 @@ def _parse_epoch(ts: str | float | int) -> float:
     return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
 
 
+def _should_persist_signal(s, settings) -> bool:
+    """Persistence gate — only spool signals worth keeping.
+
+    Drops:
+      * stale signals (no informational value)
+      * FRESH signals close to Kalshi mid AND outside top-N rank
+        (kept probabilistically for baseline calibration coverage)
+    """
+    if s.raw.staleness is not StalenessReason.FRESH:
+        return False
+    bid, ask = s.book.bid, s.book.ask
+    if bid is not None and ask is not None:
+        mid = 0.5 * (bid + ask)
+        if abs(s.raw.p - mid) >= settings.persist_min_edge_gap:
+            return True
+    if s.rank is not None and s.rank <= settings.persist_top_n_rank:
+        return True
+    return random.random() < settings.persist_sample_rate
+
+
 async def _discover_and_trade_once(
     kalshi: KalshiClient,
     signal_gen: SignalGenerator,
@@ -109,52 +131,74 @@ async def _discover_and_trade_once(
     (→ ``paper_order``) so FK resolution on the drain side always finds
     its target. The drainer processes strictly in insertion order and
     breaks on the first failure to preserve that invariant.
+
+    Persistence gate: contract_upsert/quote are buffered per-contract and
+    only flushed to the spool for signals that pass ``_should_persist_signal``.
+    Skipping the 90%+ of near-mid, unranked contracts keeps Neon write
+    volume manageable while preserving the training set.
     """
-    report = load_latest_report(default_min_sample=get_settings().phase_gate_min_sample)
+    settings = get_settings()
+    report = load_latest_report(default_min_sample=settings.phase_gate_min_sample)
     kill_switch = control.get().kill_switch_active
 
     mapper = DomainRegistry.get("crypto").mapper
     picks: list[tuple[Any, BookSnapshot]] = []
+    pending: dict[str, tuple[dict, dict]] = {}  # contract_id -> (upsert, quote)
 
-    async for m in kalshi.iter_markets(status="open"):
-        if not mapper.matches(m):
-            continue
-        contract = mapper.to_contract(m)
-        if contract is None:
-            continue
-        try:
-            ob = await kalshi.get_orderbook(contract.contract_id)
-        except Exception as e:
-            log.warning("orderbook.fetch_failed",
-                        contract=contract.contract_id, error=str(e))
-            continue
-        book = _parse_book(ob)
-        if book is None:
-            continue
+    series_tickers = mapper.discovery_series_tickers()
+    if series_tickers:
+        market_iters = [
+            kalshi.iter_markets(status="open", series_ticker=st)
+            for st in series_tickers
+        ]
+    else:
+        market_iters = [kalshi.iter_markets(status="open")]
 
-        await writer.enqueue("contract_upsert", _contract_upsert_payload(contract))
-        await writer.enqueue("quote", {
-            "contract_id": contract.contract_id,
-            "bid": book.bid,
-            "ask": book.ask,
-            "bid_size": book.bid_size,
-            "ask_size": book.ask_size,
-            "last_trade_price": None,
-            "data_ts": book.data_ts.isoformat(),
-            "ingest_ts": datetime.now(timezone.utc).isoformat(),
-        })
+    for it in market_iters:
+        async for m in it:
+            if not mapper.matches(m):
+                continue
+            contract = mapper.to_contract(m)
+            if contract is None:
+                continue
+            book = _book_from_market_row(m)
+            if book is None:
+                continue
+            if book.bid is None or book.ask is None:
+                continue
 
-        picks.append((contract, book))
+            pending[contract.contract_id] = (
+                _contract_upsert_payload(contract),
+                {
+                    "contract_id": contract.contract_id,
+                    "bid": book.bid,
+                    "ask": book.ask,
+                    "bid_size": book.bid_size,
+                    "ask_size": book.ask_size,
+                    "last_trade_price": None,
+                    "data_ts": book.data_ts.isoformat(),
+                    "ingest_ts": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            picks.append((contract, book))
 
     signals = await signal_gen.generate(picks, report)
+    persist_decisions = [_should_persist_signal(s, settings) for s in signals]
+    n_persisted = sum(persist_decisions)
+    log.info("loop.done", picks=len(picks), signals=len(signals),
+             persisted=n_persisted,
+             stale_reasons=_summarize_stale(signals))
 
-    for s in signals:
-        # One oracle estimate per signal (SignalGenerator already called the
-        # oracle inside). Persist it, then reference its external_id from
-        # the signal row so full provenance survives the ledger.
+    for s, keep in zip(signals, persist_decisions):
+        if not keep:
+            continue
+
         estimate_external_id = str(uuid.uuid4())
         signal_external_id = str(uuid.uuid4())
 
+        upsert, quote = pending[s.contract.contract_id]
+        await writer.enqueue("contract_upsert", upsert)
+        await writer.enqueue("quote", quote)
         await writer.enqueue("oracle_estimate", {
             "external_id": estimate_external_id,
             "contract_id": s.contract.contract_id,
@@ -230,6 +274,11 @@ async def _discover_and_trade_once(
         await writer.enqueue("paper_order", order_payload)
 
 
+def _summarize_stale(signals: list) -> dict[str, int]:
+    from collections import Counter
+    return dict(Counter(s.raw.staleness.value for s in signals))
+
+
 def _contract_upsert_payload(contract) -> dict[str, Any]:
     return {
         "contract_id": contract.contract_id,
@@ -246,38 +295,89 @@ def _contract_upsert_payload(contract) -> dict[str, Any]:
     }
 
 
-def _parse_book(ob: dict[str, Any]) -> BookSnapshot | None:
-    # Kalshi orderbook response: {"orderbook": {"yes": [[price_cents, size], ...],
-    #                                            "no":  [[price_cents, size], ...]}}
-    # We convert to dollars in [0, 1] and take the best (highest) bid on YES
-    # and the best (lowest) ask derived from the NO side: ask_yes = 1 - best_no_bid.
-    ob_root = ob.get("orderbook") or {}
-    yes = ob_root.get("yes") or []
-    no = ob_root.get("no") or []
-    best_yes_bid = _best_price(yes, side="bid")
-    best_no_bid = _best_price(no, side="bid")
-    bid = best_yes_bid
-    ask = None if best_no_bid is None else (1.0 - best_no_bid)
+def _book_from_market_row(m: dict[str, Any]) -> BookSnapshot | None:
+    """Best bid/ask straight off Kalshi's /markets row.
+
+    Row shape (current): yes_bid_dollars, yes_ask_dollars, no_bid_dollars,
+    no_ask_dollars as decimal strings/floats in [0, 1]; *_size_fp for sizes.
+    A zero bid/ask means "no live order" — treat as None so downstream mid()
+    guards work.
+    """
+    def _num(v: Any) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0.0 else None
+
+    yes_bid = _num(m.get("yes_bid_dollars"))
+    yes_ask = _num(m.get("yes_ask_dollars"))
+    no_bid = _num(m.get("no_bid_dollars"))
+    # YES ask can also be derived from NO bid: ask_yes = 1 - no_bid. Prefer
+    # the direct yes_ask when Kalshi publishes it, else fall back.
+    bid = yes_bid
+    ask = yes_ask if yes_ask is not None else (
+        (1.0 - no_bid) if no_bid is not None else None
+    )
     if bid is None and ask is None:
         return None
+    bid_size = _num(m.get("yes_bid_size_fp"))
+    ask_size = _num(m.get("yes_ask_size_fp"))
     return BookSnapshot(
         bid=bid, ask=ask,
-        bid_size=None, ask_size=None,
+        bid_size=bid_size, ask_size=ask_size,
         data_ts=datetime.now(timezone.utc),
     )
 
 
-def _best_price(levels: list, side: str) -> float | None:
-    prices = []
+def _parse_book(ob: dict[str, Any]) -> BookSnapshot | None:
+    # Kalshi orderbook response (current shape):
+    #   {"orderbook_fp": {"yes_dollars": [["0.01", "size"], ...],
+    #                      "no_dollars":  [["0.01", "size"], ...]}}
+    # Prices are strings in dollars [0, 1]; each list holds bids for that side.
+    # Best YES bid = max yes price. YES ask is derived from best NO bid:
+    # ask_yes = 1 - best_no_bid.
+    ob_root = ob.get("orderbook_fp") or ob.get("orderbook") or {}
+    yes = ob_root.get("yes_dollars") or ob_root.get("yes") or []
+    no = ob_root.get("no_dollars") or ob_root.get("no") or []
+    yes_price, yes_size = _best_bid(yes)
+    no_price, no_size = _best_bid(no)
+    bid = yes_price
+    ask = None if no_price is None else (1.0 - no_price)
+    ask_size = no_size
+    if bid is None and ask is None:
+        return None
+    return BookSnapshot(
+        bid=bid, ask=ask,
+        bid_size=yes_size, ask_size=ask_size,
+        data_ts=datetime.now(timezone.utc),
+    )
+
+
+def _best_bid(levels: list) -> tuple[float | None, float | None]:
+    """Best (highest) bid price and its size from a Kalshi orderbook side.
+
+    Kalshi's ``*_dollars`` levels come as ``[["0.0100", "size"], ...]`` with
+    prices as decimal strings already in dollar units. Some legacy
+    ``yes``/``no`` fields carried integer cents; handle both by inferring
+    scale from magnitude.
+    """
+    best_price: float | None = None
+    best_size: float | None = None
     for row in levels or []:
         try:
-            price_cents = float(row[0])
-            prices.append(price_cents / 100.0)
+            raw_price = float(row[0])
+            size = float(row[1]) if len(row) > 1 else None
         except (TypeError, ValueError, IndexError):
             continue
-    if not prices:
-        return None
-    return max(prices) if side == "bid" else min(prices)
+        # If the value is > 1 assume cents (legacy shape); else dollars.
+        price = raw_price / 100.0 if raw_price > 1.0 else raw_price
+        if best_price is None or price > best_price:
+            best_price = price
+            best_size = size
+    return best_price, best_size
 
 
 async def run() -> None:
@@ -340,10 +440,12 @@ async def run() -> None:
             ),
         ),
         spool=writer,
+        record_raw_pulls=settings.persist_raw_pulls,
     )
     kraken_ws = KrakenWs(
         KrakenConfig(rest_base=settings.kraken_rest_base, ws_url=settings.kraken_ws_url),
         spool=writer,
+        record_raw_pulls=settings.persist_raw_pulls,
     )
 
     fees = KalshiFeeSchedule()

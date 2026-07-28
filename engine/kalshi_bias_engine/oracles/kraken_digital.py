@@ -34,10 +34,12 @@ from ..ingest.realized_vol import MultiHorizonVol
 
 # Crypto feature keys the CryptoMarketMapper is expected to populate.
 FEAT_STRIKE = "strike"
+FEAT_STRIKE_LO = "strike_lo"          # bracket lower bound
+FEAT_STRIKE_HI = "strike_hi"          # bracket upper bound
 FEAT_DIRECTION = "direction"          # 'above' | 'below' | 'above_or_touch'
 FEAT_HORIZON_SEC = "horizon_seconds"  # time to expiry from decision moment
 FEAT_UNDERLYING = "underlying_symbol"
-FEAT_CONTRACT_TYPE = "contract_type"  # 'threshold' | 'up_down_5m' | 'up_down_15m'
+FEAT_CONTRACT_TYPE = "contract_type"  # 'threshold' | 'bracket' | 'up_down_5m' | 'up_down_15m'
 
 
 @dataclass
@@ -60,13 +62,31 @@ class OracleContext:
     basis_bps: dict[str, float]                          # underlying -> mean basis
     basis_std_bps: dict[str, float]                      # underlying -> stdev of basis
     now_epoch: float
-    max_spot_staleness_sec: float = 5.0
+    max_spot_staleness_sec: float = 30.0
     min_tick_sample: int = 30
+    # Log-return noise floor applied at settlement. Without this, σ√T → 0
+    # as the contract nears close and the lognormal digital blows up to
+    # p∈{0,1}. Real settlements have residual noise (CF Benchmarks is a
+    # windowed composite, and there is minute-scale spot jitter besides).
+    # 10 bps ≈ typical BTC 1-minute log-return stdev.
+    settlement_noise_log: float = 0.001
 
 
 class KrakenDigitalOptionOracle(Oracle):
     name = "kraken_digital"
-    version = "1"
+    # v4: vol-horizon fallback + insufficient-window guard in RollingVol.
+    #     v3 asked the 24h vol bucket for sigma when it had only 60s of
+    #     ticks; annualizing that noise produced σ≈200 and priced every
+    #     24h contract at the boundary. Now: shorter horizons fall back
+    #     through, and the vol store refuses to emit sigma until the
+    #     observed window covers ≥25% of the requested horizon.
+    # v3: settlement noise floor (see OracleContext.settlement_noise_log)
+    #     added so the digital does not blow up to p∈{0,1} as horizon → 0.
+    # v2: bracket contracts priced as Φ(d2_lo) − Φ(d2_hi) instead of
+    #     single-strike "above cap_strike".
+    # v1: original — broken bracket pricing AND broken horizon (used
+    #     expiration_time ≈ 7 days instead of close_time).
+    version = "4"
 
     def __init__(self, ctx_provider) -> None:
         """``ctx_provider`` is a callable returning a fresh OracleContext."""
@@ -76,23 +96,35 @@ class KrakenDigitalOptionOracle(Oracle):
         if contract.domain != "crypto":
             return False
         ctype = contract.feature(FEAT_CONTRACT_TYPE)
-        return ctype in {"threshold", "up_down_5m", "up_down_15m"}
+        return ctype in {"threshold", "bracket", "up_down_5m", "up_down_15m"}
 
     async def estimate(self, contract: Contract) -> ProbEstimate:
         ctx: OracleContext = self._ctx_provider()
         underlying = contract.feature(FEAT_UNDERLYING) or contract.underlying
         strike = contract.feature(FEAT_STRIKE)
+        strike_lo = contract.feature(FEAT_STRIKE_LO)
+        strike_hi = contract.feature(FEAT_STRIKE_HI)
         direction = contract.feature(FEAT_DIRECTION, "above")
         horizon = contract.feature(FEAT_HORIZON_SEC)
+        contract_type = contract.feature(FEAT_CONTRACT_TYPE)
+        is_bracket = contract_type == "bracket"
 
         prov: dict = {
             "underlying": underlying, "strike": strike,
+            "strike_lo": strike_lo, "strike_hi": strike_hi,
             "direction": direction, "horizon_seconds": horizon,
+            "contract_type": contract_type,
         }
 
         # --- Input validation ------------------------------------------------
-        if strike is None or horizon is None or horizon <= 0:
+        if horizon is None or horizon <= 0:
             return self._stale(StalenessReason.MODEL_OUT_OF_DOMAIN, prov)
+        if is_bracket:
+            if strike_lo is None or strike_hi is None or strike_hi <= strike_lo:
+                return self._stale(StalenessReason.MODEL_OUT_OF_DOMAIN, prov)
+        else:
+            if strike is None:
+                return self._stale(StalenessReason.MODEL_OUT_OF_DOMAIN, prov)
 
         spot = ctx.spot.get(underlying)
         if spot is None:
@@ -103,17 +135,19 @@ class KrakenDigitalOptionOracle(Oracle):
             return self._stale(StalenessReason.STALE_SPOT, prov)
         prov["spot"] = spot.price
 
-        # Pick horizon-matched realized vol bucket (nearest not longer than horizon).
-        vol_horizon = self._pick_vol_horizon(ctx.vol_store.horizons, horizon)
-        vol_pt = ctx.vol_store.latest(underlying, vol_horizon)
-        if vol_pt is None or vol_pt.sigma_annualized <= 0:
+        # Pick horizon-matched realized vol bucket (longest not exceeding
+        # the contract horizon). If that bucket hasn't collected enough
+        # window yet (vol store returns sigma=0), fall back through
+        # progressively shorter horizons so a warm-up process still prices
+        # 24h contracts off the 15m/1h bucket instead of waiting hours.
+        vol_pt, vol_horizon = self._pick_vol_with_fallback(
+            ctx.vol_store, underlying, horizon, ctx.min_tick_sample
+        )
+        if vol_pt is None:
             return self._stale(StalenessReason.THIN_SAMPLE, prov)
         prov["vol_horizon_seconds"] = vol_horizon
         prov["sigma_annualized"] = vol_pt.sigma_annualized
         prov["tick_count"] = vol_pt.tick_count
-
-        if vol_pt.tick_count < ctx.min_tick_sample:
-            return self._stale(StalenessReason.THIN_SAMPLE, prov)
 
         # --- Pricing ---------------------------------------------------------
         # Lognormal short-horizon, drift = 0 (crypto short-horizon).
@@ -121,16 +155,38 @@ class KrakenDigitalOptionOracle(Oracle):
         T = horizon / (365.25 * 86_400.0)
         sigma = vol_pt.sigma_annualized
         S = spot.price
-        K = strike
 
-        # d2 for P(S_T > K) under GBM with mu=0
-        d2 = (math.log(S / K) - 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
-        if direction == "above" or direction == "above_or_touch":
-            p_raw = float(norm.cdf(d2))
-        elif direction == "below":
-            p_raw = float(norm.cdf(-d2))
+        # Log-return stdev over horizon T, floored by settlement noise so
+        # the digital doesn't collapse to {0,1} as horizon → 0. See
+        # ``OracleContext.settlement_noise_log``.
+        eps = ctx.settlement_noise_log
+        stdev_lr = math.sqrt(sigma * sigma * T + eps * eps)
+        drift = 0.5 * sigma * sigma * T  # d2 mean-shift; leave as-is
+        prov["stdev_log_return"] = stdev_lr
+        prov["settlement_noise_log"] = eps
+
+        if is_bracket:
+            # P(K_lo <= S_T <= K_hi) = P(S_T > K_lo) - P(S_T > K_hi)
+            #                        = Φ(d2_lo) - Φ(d2_hi)
+            d2_lo = (math.log(S / strike_lo) - drift) / stdev_lr
+            d2_hi = (math.log(S / strike_hi) - drift) / stdev_lr
+            p_raw = float(norm.cdf(d2_lo) - norm.cdf(d2_hi))
+            prov["d2_lo"] = d2_lo
+            prov["d2_hi"] = d2_hi
+            # For variance / tail-signal purposes use the midpoint d2.
+            K_ref = 0.5 * (strike_lo + strike_hi)
+            d2_ref = (math.log(S / K_ref) - drift) / stdev_lr
         else:
-            return self._stale(StalenessReason.MODEL_OUT_OF_DOMAIN, prov)
+            K = strike
+            d2 = (math.log(S / K) - drift) / stdev_lr
+            if direction == "above" or direction == "above_or_touch":
+                p_raw = float(norm.cdf(d2))
+            elif direction == "below":
+                p_raw = float(norm.cdf(-d2))
+            else:
+                return self._stale(StalenessReason.MODEL_OUT_OF_DOMAIN, prov)
+            K_ref = K
+            d2_ref = d2
         prov["p_raw_lognormal"] = p_raw
 
         # --- Tail inflation --------------------------------------------------
@@ -150,19 +206,19 @@ class KrakenDigitalOptionOracle(Oracle):
         # Delta-method through sigma: variance of p wrt sigma dominates for
         # short-horizon crypto. Also fold in the basis-uncertainty term:
         # a noisy Kraken->CF-Benchmarks basis widens our CI proportionally.
-        sqrtT = math.sqrt(T)
-        # dp/dsigma for lognormal digital call (approx)
-        pdf = float(norm.pdf(d2))
-        dd2_dsigma = -(math.log(S / K)) / (sigma * sigma * sqrtT) - 0.5 * sqrtT
+        # Uses stdev_lr (floored by settlement noise) as the denominator so
+        # derivatives don't blow up as T → 0.
+        pdf = float(norm.pdf(d2_ref))
+        dd2_dsigma = -(math.log(S / K_ref)) * (sigma * T) / (stdev_lr ** 3) - (sigma * T) / stdev_lr
         dp_dsigma = pdf * dd2_dsigma
         sigma_var = (sigma ** 2) / max(vol_pt.tick_count, 1)  # crude
         var_from_sigma = (dp_dsigma ** 2) * sigma_var
 
         # Basis contributes as if it were a noisy strike offset.
         basis_std = ctx.basis_std_bps.get(underlying, 0.0) / 1e4
-        # dp/dK = -pdf / (K * sigma * sqrt(T))
-        dp_dK = -pdf / (K * sigma * sqrtT)
-        var_from_basis = (dp_dK * K * basis_std) ** 2
+        # dp/dK = -pdf / (K * stdev_lr)
+        dp_dK = -pdf / (K_ref * stdev_lr)
+        var_from_basis = (dp_dK * K_ref * basis_std) ** 2
 
         variance = var_from_sigma + var_from_basis
         prov["variance_from_sigma"] = var_from_sigma
@@ -192,6 +248,27 @@ class KrakenDigitalOptionOracle(Oracle):
         # if none fits, fall back to the shortest available.
         fits = [h for h in horizons if h <= target_seconds]
         return max(fits) if fits else min(horizons)
+
+    @staticmethod
+    def _pick_vol_with_fallback(vol_store, underlying, target_seconds, min_ticks):
+        # Try longest-fitting first (best matched to contract horizon),
+        # fall back to shorter horizons if the longer bucket hasn't
+        # accumulated enough window yet. If nothing at-or-below the
+        # target has data, try longer horizons as a last resort.
+        horizons = sorted(vol_store.horizons)
+        at_or_below = [h for h in horizons if h <= target_seconds]
+        above = [h for h in horizons if h > target_seconds]
+        candidates = list(reversed(at_or_below)) + above
+        for h in candidates:
+            pt = vol_store.latest(underlying, h)
+            if pt is None:
+                continue
+            if pt.sigma_annualized <= 0:
+                continue
+            if pt.tick_count < min_ticks:
+                continue
+            return pt, h
+        return None, 0
 
     @staticmethod
     def _tail_signal(p: float) -> float:

@@ -29,3 +29,28 @@ def _seeded_rng():
     r = random.Random(42)
     while True:
         yield r.gauss(0.0, 1.0)
+
+
+def test_short_window_relative_to_horizon_returns_zero_sigma() -> None:
+    # 60 seconds of ticks projected to a 24h horizon must NOT annualize
+    # into a wild sigma — before the guard a single 3% tick inflated
+    # sigma_annualized to >200.
+    rv = RollingVol(underlying="BTC", horizon_seconds=86_400)
+    price = 50_000.0
+    for i in range(60):
+        rv.update(float(i), price * (1.0005 if i == 30 else 1.0))
+    pt = rv.snapshot()
+    assert pt is not None
+    assert pt.tick_count == 60
+    assert pt.sigma_annualized == 0.0  # marked stale by insufficient window
+
+
+def test_snapshot_is_side_effect_free() -> None:
+    rv = RollingVol(underlying="BTC", horizon_seconds=1_000)
+    for i in range(10):
+        rv.update(float(i), 100.0 + i * 0.01)
+    before = len(rv._points)  # noqa: SLF001
+    rv.snapshot()
+    rv.snapshot()
+    rv.snapshot()
+    assert len(rv._points) == before  # noqa: SLF001

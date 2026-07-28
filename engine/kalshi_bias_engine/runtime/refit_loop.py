@@ -25,11 +25,13 @@ cannot stall the refit loop any more than it can stall the trading loop.
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime, timezone
 from typing import Iterable
 
 import structlog
 
+from scipy.stats import norm
 from sqlalchemy import select
 
 from ..bias.features import (
@@ -78,11 +80,127 @@ def _mid_price(bid: float | None, ask: float | None) -> float | None:
     return 0.5 * (bid + ask)
 
 
+# Must match ``OracleContext.settlement_noise_log`` so the reprice mirrors
+# what the live oracle would produce.
+_REPRICE_SETTLEMENT_NOISE_LOG = 0.001
+# Drop repriced rows whose stored sigma exceeds this — pre-v4 provenance
+# occasionally contains sigmas of 100+ due to the insufficient-window
+# annualization bug. Those rows would still poison the calibration even
+# after repricing.
+_REPRICE_MAX_ANNUAL_SIGMA = 5.0
+
+
+import re as _re
+_NUM_RE = _re.compile(r"[\d,]+(?:\.\d+)?")
+_BRACKET_RE = _re.compile(r"\$[\d,]+(?:\.\d+)?\s*to\s*[\d,]+(?:\.\d+)?", _re.IGNORECASE)
+_ABOVE_RE = _re.compile(r"\$[\d,]+(?:\.\d+)?\s*(?:or\s+above|and\s+above|\+)", _re.IGNORECASE)
+_BELOW_RE = _re.compile(r"\$[\d,]+(?:\.\d+)?\s*(?:or\s+below|and\s+below|-)", _re.IGNORECASE)
+
+
+def _reparse_features_from_sub_title(features: dict) -> dict:
+    """The pre-fix mapper mislabeled ``$X to Y`` bracket sub-titles as
+    threshold-above, and stored only the upper bound as ``strike``. Fix
+    both here so historical rows get priced correctly during reprice."""
+    sub = str(features.get("raw_yes_sub_title") or "")
+    if not sub:
+        return features
+    # Bracket already correctly populated → no-op.
+    if features.get("strike_lo") is not None and features.get("strike_hi") is not None:
+        return features
+    if _BRACKET_RE.search(sub):
+        nums = _NUM_RE.findall(sub)
+        if len(nums) >= 2:
+            try:
+                a = float(nums[0].replace(",", ""))
+                b = float(nums[1].replace(",", ""))
+            except ValueError:
+                return features
+            lo, hi = (a, b) if a <= b else (b, a)
+            fx = dict(features)
+            fx["strike_lo"] = lo
+            fx["strike_hi"] = hi
+            fx["strike"] = 0.5 * (lo + hi)
+            fx["contract_type"] = "bracket"
+            fx["direction"] = "between"
+            return fx
+    if _BELOW_RE.search(sub) and features.get("direction") != "below":
+        fx = dict(features)
+        fx["direction"] = "below"
+        return fx
+    # "or above" is the default the old mapper already used — no fix needed.
+    return features
+
+
+def _reprice_v1(prov: dict, features: dict | None, close_time, ingest_ts) -> float | None:
+    """Retroactively reprice a v1 estimate using v3 math.
+
+    v1 had two independent bugs that v2/v3 fix:
+      * brackets priced as ``above cap_strike`` instead of
+        ``Φ(d2_lo) − Φ(d2_hi)``
+      * horizon used ``expiration_time`` (~7d out) instead of ``close_time``
+
+    Provenance carries the historical spot / sigma / direction, and the
+    contract carries the (now-correct) close_time and strike_lo/strike_hi,
+    so we can reconstruct what v3 would have said. Returns None if inputs
+    are insufficient to reprice (row should be skipped)."""
+    if close_time is None or ingest_ts is None:
+        return None
+    try:
+        spot = float(prov["spot"])
+        sigma = float(prov["sigma_annualized"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if sigma <= 0.0 or spot <= 0.0:
+        return None
+    if sigma > _REPRICE_MAX_ANNUAL_SIGMA:
+        return None
+    # Real horizon = close - decision moment.
+    horizon = (close_time - ingest_ts).total_seconds()
+    if horizon <= 0.0:
+        return None
+
+    features = _reparse_features_from_sub_title(features or {})
+    T = horizon / (365.25 * 86_400.0)
+    eps = _REPRICE_SETTLEMENT_NOISE_LOG
+    stdev_lr = math.sqrt(sigma * sigma * T + eps * eps)
+    drift = 0.5 * sigma * sigma * T
+
+    # Bracket if both strike_lo AND strike_hi live on the contract features
+    # (mapper populates these only for bracket markets).
+    strike_lo = features.get("strike_lo")
+    strike_hi = features.get("strike_hi")
+    if strike_lo is not None and strike_hi is not None and strike_hi > strike_lo:
+        d2_lo = (math.log(spot / strike_lo) - drift) / stdev_lr
+        d2_hi = (math.log(spot / strike_hi) - drift) / stdev_lr
+        return max(0.0, min(1.0, float(norm.cdf(d2_lo) - norm.cdf(d2_hi))))
+
+    strike = features.get("strike") or prov.get("strike")
+    if strike is None:
+        return None
+    try:
+        K = float(strike)
+    except (TypeError, ValueError):
+        return None
+    if K <= 0.0:
+        return None
+    # Prefer corrected direction from features; fall back to provenance.
+    direction = features.get("direction") or prov.get("direction", "above")
+    d2 = (math.log(spot / K) - drift) / stdev_lr
+    if direction in ("above", "above_or_touch"):
+        return float(norm.cdf(d2))
+    if direction == "below":
+        return float(norm.cdf(-d2))
+    return None
+
+
 def _load_settled_rows() -> list[dict]:
     """Load (signal, oracle_estimate, contract, settlement) tuples for
-    every settled record. Kept intentionally simple; if this outgrows
-    process memory we page it, but for a single-domain V1 the volume is
-    small."""
+    every settled record.
+
+    v1 estimates are retroactively repriced with v2 math (see
+    :func:`_reprice_v1`). This gives the refit access to the historical
+    corpus without waiting for v2 estimates to accumulate through fresh
+    settlements. Rows that can't be repriced are dropped."""
 
     with session_scope() as sess:
         rows = sess.execute(
@@ -93,17 +211,25 @@ def _load_settled_rows() -> list[dict]:
                 Signal.kalshi_ask,
                 OracleEstimate.p,
                 OracleEstimate.provenance,
+                OracleEstimate.oracle_version,
+                OracleEstimate.ingest_ts,
                 Contract.domain,
+                Contract.close_time,
+                Contract.features,
                 Settlement.outcome,
             )
             .join(OracleEstimate,
                   OracleEstimate.id == Signal.oracle_estimate_pk)
             .join(Contract, Contract.id == Signal.contract_pk)
             .join(Settlement, Settlement.contract_pk == Signal.contract_pk)
+            .where(OracleEstimate.staleness == "FRESH")
             .order_by(Signal.created_at.asc())
         ).all()
 
     out: list[dict] = []
+    n_v1_repriced = 0
+    n_v1_dropped = 0
+    n_v2 = 0
     for r in rows:
         y = _outcome_to_y(r.outcome)
         if y is None:
@@ -112,17 +238,35 @@ def _load_settled_rows() -> list[dict]:
         if mid is None:
             continue
         prov = r.provenance or {}
+
+        if r.oracle_version == "1":
+            p = _reprice_v1(prov, r.features, r.close_time, r.ingest_ts)
+            if p is None:
+                n_v1_dropped += 1
+                continue
+            n_v1_repriced += 1
+        else:
+            p = r.p
+            n_v2 += 1
+
         out.append({
             "t_decision": r.created_at,
             "domain": r.domain,
             "kalshi_price": mid,
-            "raw_p": r.p,
-            "adjusted_p": r.adjusted_p,
+            "raw_p": p,
+            # adjusted_p was computed at decision time from the (broken) v1
+            # p. If we're using a repriced raw_p, propagate it as adjusted
+            # too — no bias features contributed yet (all gated off), so
+            # adjusted == raw for the refit's purposes.
+            "adjusted_p": p if r.oracle_version == "1" else r.adjusted_p,
             "y": y,
             "recent_log_return": prov.get("recent_log_return"),
             "session_bucket": prov.get("session_bucket"),
             "round_number_distance": prov.get("round_number_distance"),
         })
+
+    log.info("refit.rows_loaded", v1_repriced=n_v1_repriced,
+             v1_dropped=n_v1_dropped, v2=n_v2, total=len(out))
     return out
 
 
