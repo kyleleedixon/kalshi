@@ -4,7 +4,7 @@ Auto-published by the box (`ops/publish.py`). Do not edit by hand —
 it is overwritten on every run. Cloud agents read this because they
 cannot reach the server or the database directly.
 
-Generated: 2026-09-21 22:22 UTC
+Generated: 2026-09-21 23:22 UTC
 
 ## Trading
 
@@ -31,8 +31,8 @@ within one tag; see `research/REGISTRY.md` for the kill rules.
 - ok `fill_drought` — halted on purpose - H-001 refuted 2026-09-16 at 576 contracts, E
 - ok `gate_ratchet` — n/a while halted
 - ok `horizon_ratchet` — all cutoffs <=900s
-- **FIRING** `book_staleness` — median book age 33157 ms (target <2000)
-- ok `pnl_breach` — 10 settlement-days in last 14d
+- ok `book_staleness` — no signals in last hour
+- ok `pnl_breach` — 9 settlement-days in last 14d
 
 ## Notes for a reviewing agent
 
