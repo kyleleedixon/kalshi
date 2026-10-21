@@ -4,15 +4,15 @@ Auto-published by the box (`ops/publish.py`). Do not edit by hand —
 it is overwritten on every run. Cloud agents read this because they
 cannot reach the server or the database directly.
 
-Generated: 2026-10-20 23:47 UTC
+Generated: 2026-10-21 00:47 UTC
 
 ## Trading
 
 - **Status: HALTED**
 - Halt reason: H-001 refuted 2026-09-16 at 576 contracts, EV -$0.0462 vs +$0.02 threshold; pre-committed kill rule
-- Equity: $35.62 (-0.42 over 24h)
+- Equity: $35.62 (+35.62 over 24h)
 - Active slice gates: 0
-- Loop cadence: 60-266s over last 5 cycles
+- Loop cadence: 87-672s over last 5 cycles
 
 ## Hypothesis progress
 
@@ -31,7 +31,7 @@ within one tag; see `research/REGISTRY.md` for the kill rules.
 - ok `fill_drought` — halted on purpose - H-001 refuted 2026-09-16 at 576 contracts, E
 - ok `gate_ratchet` — n/a while halted
 - ok `horizon_ratchet` — all cutoffs <=900s
-- **FIRING** `book_staleness` — median book age 30764 ms (target <2000)
+- **FIRING** `book_staleness` — median book age 40771 ms (target <2000)
 - ok `pnl_breach` — n/a while halted
 
 ## Notes for a reviewing agent
