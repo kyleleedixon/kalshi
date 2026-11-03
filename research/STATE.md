@@ -4,15 +4,15 @@ Auto-published by the box (`ops/publish.py`). Do not edit by hand —
 it is overwritten on every run. Cloud agents read this because they
 cannot reach the server or the database directly.
 
-Generated: 2026-11-03 14:48 UTC
+Generated: 2026-11-03 16:49 UTC
 
 ## Trading
 
 - **Status: HALTED**
 - Halt reason: H-001 refuted 2026-09-16 at 576 contracts, EV -$0.0462 vs +$0.02 threshold; pre-committed kill rule
-- Equity: $167.24 (+130.35 over 24h)
+- Equity: $170.90 (+134.01 over 24h)
 - Active slice gates: 0
-- Loop cadence: 392-4949s over last 5 cycles
+- Loop cadence: 501-4949s over last 5 cycles
 
 ## Hypothesis progress
 
